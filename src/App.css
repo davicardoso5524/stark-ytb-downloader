@@ -299,6 +299,11 @@ button:hover {
   background: linear-gradient(90deg, #ff5540, #ffb4a8);
 }
 
+.download-button {
+  width: 100%;
+  margin-top: 0.9rem;
+}
+
 .empty {
   margin-top: 0.8rem;
   color: #caada8;

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
@@ -12,6 +13,16 @@ type VideoMetadata = {
   thumbnail?: string;
 };
 
+type DownloadProgressEvent = {
+  videoTitle: string;
+  percent: number;
+  rawLine: string;
+};
+
+type DownloadDoneEvent = {
+  message: string;
+};
+
 function App() {
   const [url, setUrl] = useState("");
   const [destinationFolder, setDestinationFolder] = useState("");
@@ -19,6 +30,9 @@ function App() {
   const [error, setError] = useState("");
   const [metadata, setMetadata] = useState<VideoMetadata | null>(null);
   const [isValidating, setIsValidating] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadPercent, setDownloadPercent] = useState(0);
+  const [downloadTitle, setDownloadTitle] = useState("");
   const [splashVisible, setSplashVisible] = useState(true);
   const [splashStep, setSplashStep] = useState(0);
 
@@ -44,6 +58,48 @@ function App() {
     }, 420);
 
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let disposeProgress: (() => void) | undefined;
+    let disposeComplete: (() => void) | undefined;
+    let disposeError: (() => void) | undefined;
+
+    const setupListeners = async () => {
+      disposeProgress = await listen<DownloadProgressEvent>("download-progress", (event) => {
+        setIsDownloading(true);
+        setDownloadPercent(Math.max(0, Math.min(100, Number(event.payload.percent) || 0)));
+        if (event.payload.videoTitle) {
+          setDownloadTitle(event.payload.videoTitle);
+        }
+      });
+
+      disposeComplete = await listen<DownloadDoneEvent>("download-complete", (event) => {
+        setIsDownloading(false);
+        setDownloadPercent(100);
+        setStatus(event.payload.message);
+      });
+
+      disposeError = await listen<DownloadDoneEvent>("download-error", (event) => {
+        setIsDownloading(false);
+        setError(event.payload.message);
+        setStatus("Falha no download.");
+      });
+    };
+
+    setupListeners();
+
+    return () => {
+      if (disposeProgress) {
+        disposeProgress();
+      }
+      if (disposeComplete) {
+        disposeComplete();
+      }
+      if (disposeError) {
+        disposeError();
+      }
+    };
   }, []);
 
   const isUrlFormatValid = useMemo(() => {
@@ -103,6 +159,38 @@ function App() {
       setStatus("Falha na validacao da URL.");
     } finally {
       setIsValidating(false);
+    }
+  }
+
+  async function startDownload() {
+    setError("");
+
+    if (!metadata) {
+      setError("Valide uma URL primeiro para iniciar o download.");
+      return;
+    }
+
+    if (!destinationFolder.trim()) {
+      setError("Selecione uma pasta de destino antes do download.");
+      return;
+    }
+
+    setDownloadPercent(0);
+    setDownloadTitle(metadata.title);
+    setIsDownloading(true);
+    setStatus("Iniciando download...");
+
+    try {
+      await invoke("start_download", {
+        url: url.trim(),
+        destinationFolder: destinationFolder.trim(),
+        videoTitle: metadata.title,
+      });
+    } catch (err) {
+      setIsDownloading(false);
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      setStatus("Falha ao iniciar download.");
     }
   }
 
@@ -176,25 +264,18 @@ function App() {
       <section className="download-card">
         <div className="download-header">
           <h2>Download Atual</h2>
-          <span className="badge">PRE-CHECK</span>
+          <span className="badge">{isDownloading ? "DOWNLOADING" : "READY"}</span>
         </div>
 
-        {metadata ? (
+        {metadata || downloadTitle ? (
           <div className="video-row">
-            {metadata.thumbnail ? (
+            {metadata?.thumbnail ? (
               <img src={metadata.thumbnail} alt="Thumbnail do video" className="video-thumb" />
             ) : (
               <div className="video-thumb video-thumb-fallback">NO THUMB</div>
             )}
             <div className="video-info">
-              <h3>{metadata.title}</h3>
-              <p>{metadata.uploader ?? "Canal nao informado"}</p>
-              <p>
-                Duracao:{" "}
-                {metadata.durationSeconds
-                  ? `${Math.floor(metadata.durationSeconds / 60)}m ${metadata.durationSeconds % 60}s`
-                  : "Nao informada"}
-              </p>
+              <h3>{downloadTitle || metadata?.title}</h3>
             </div>
           </div>
         ) : (
@@ -204,12 +285,21 @@ function App() {
         <div className="progress-wrap">
           <div className="progress-meta">
             <span>Progresso</span>
-            <span>{metadata ? "0%" : "--"}</span>
+            <span>{metadata || downloadTitle ? `${downloadPercent.toFixed(1)}%` : "--"}</span>
           </div>
           <div className="progress-bar">
-            <div className="progress-fill" style={{ width: metadata ? "0%" : "0%" }} />
+            <div className="progress-fill" style={{ width: `${downloadPercent}%` }} />
           </div>
         </div>
+
+        <button
+          type="button"
+          className="btn-primary download-button"
+          onClick={startDownload}
+          disabled={isDownloading || !metadata}
+        >
+          {isDownloading ? "BAIXANDO..." : "INICIAR DOWNLOAD"}
+        </button>
 
         <p className="status">Status: {status}</p>
         {error ? <p className="error">Erro: {error}</p> : null}
