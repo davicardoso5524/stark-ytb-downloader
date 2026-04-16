@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
-const LICENSE_PRODUCT: &str = "yt-download";
+const LICENSE_PRODUCT: &str = "stark-tube";
 const LICENSE_VERSION: &str = "1";
 const LICENSE_KEY_PREFIX: &str = "YTDL1";
 // Troque por sua chave publica Ed25519 em base64 (32 bytes).
