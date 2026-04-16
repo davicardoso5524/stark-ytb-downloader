@@ -60,7 +60,7 @@ const HISTORY_LIMIT = 25;
 const SETTINGS_STORAGE_KEY = "stark_tube_settings_v1";
 const LICENSE_STORAGE_KEY = "stark_tube_license_key_v1";
 const USER_NAME_STORAGE_KEY = "stark_tube_user_name_v1";
-const KEY_SITE_URL = "https://seu-site-de-keys.com";
+const KEY_SITE_URL = "https://starktube-web-key.vercel.app/";
 
 type DownloadConfig = {
   url: string;
