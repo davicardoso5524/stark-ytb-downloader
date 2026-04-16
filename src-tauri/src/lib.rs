@@ -1,9 +1,20 @@
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
+
+const LICENSE_PRODUCT: &str = "stark-tube";
+const LICENSE_VERSION: &str = "1";
+const LICENSE_KEY_PREFIX: &str = "YTDL1";
+// Troque por sua chave publica Ed25519 em base64 (32 bytes).
+const LICENSE_PUBLIC_KEY_B64: &str = "MCowBQYDK2VwAyEA+x+CjctZxm3BcmhrRhygWtED3EIKFg398yvLK4qObUU=";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -14,6 +25,24 @@ struct VideoMetadata {
     duration_seconds: Option<u64>,
     webpage_url: Option<String>,
     thumbnail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaylistEntry {
+    id: String,
+    title: String,
+    url: String,
+    channel: Option<String>,
+    duration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaylistData {
+    id: Option<String>,
+    title: String,
+    entries: Vec<PlaylistEntry>,
 }
 
 #[derive(Debug)]
@@ -34,6 +63,26 @@ struct RawYtDlpJson {
     thumbnail: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPlaylistEntry {
+    id: Option<String>,
+    title: Option<String>,
+    url: Option<String>,
+    webpage_url: Option<String>,
+    uploader: Option<String>,
+    channel: Option<String>,
+    duration: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPlaylistJson {
+    id: Option<String>,
+    title: Option<String>,
+    entries: Option<Vec<RawPlaylistEntry>>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DownloadProgressEvent {
@@ -46,6 +95,244 @@ struct DownloadProgressEvent {
 #[serde(rename_all = "camelCase")]
 struct DownloadDoneEvent {
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LicenseChallenge {
+    product: String,
+    version: String,
+    platform: String,
+    machine_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LicenseClaims {
+    product: String,
+    version: Option<serde_json::Value>,
+    email: Option<String>,
+    machine_code: Option<String>,
+    exp: Option<u64>,
+    iat: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LicenseClaimsPublic {
+    product: String,
+    version: Option<String>,
+    email: Option<String>,
+    machine_code: Option<String>,
+    exp: Option<u64>,
+    iat: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LicenseVerificationResult {
+    valid: bool,
+    message: String,
+    claims: Option<LicenseClaimsPublic>,
+}
+
+fn platform_label() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn machine_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-machine".to_string())
+}
+
+fn machine_code() -> String {
+    let raw = format!(
+        "{}|{}|{}|{}",
+        LICENSE_PRODUCT,
+        platform_label(),
+        std::env::consts::ARCH,
+        machine_name()
+    );
+
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    let digest = hasher.finalize();
+    hex::encode_upper(digest)[..32].to_string()
+}
+
+fn current_unix_secs() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|err| format!("Relogio do sistema invalido: {}", err))
+}
+
+fn parse_license_key_parts(license_key: &str) -> Result<(String, String), String> {
+    let trimmed = license_key.trim();
+    if trimmed.is_empty() {
+        return Err("Informe a chave de licenca.".to_string());
+    }
+
+    let mut parts = trimmed.split('.');
+    let prefix = parts.next().unwrap_or_default();
+    let payload_b64 = parts.next().unwrap_or_default();
+    let signature_b64 = parts.next().unwrap_or_default();
+
+    if parts.next().is_some() {
+        return Err("Formato de chave invalido.".to_string());
+    }
+
+    if prefix != LICENSE_KEY_PREFIX || payload_b64.is_empty() || signature_b64.is_empty() {
+        return Err("Formato de chave invalido.".to_string());
+    }
+
+    Ok((payload_b64.to_string(), signature_b64.to_string()))
+}
+
+fn decode_public_key() -> Result<VerifyingKey, String> {
+    let decoded = STANDARD
+        .decode(LICENSE_PUBLIC_KEY_B64)
+        .map_err(|err| format!("Falha ao ler chave publica: {}", err))?;
+
+    // Accept both encodings:
+    // 1) raw Ed25519 public key (32 bytes)
+    // 2) SPKI DER for Ed25519 (44 bytes):
+    //    30 2A 30 05 06 03 2B 65 70 03 21 00 || <32-byte key>
+    let key_slice: &[u8] = if decoded.len() == 32 {
+        decoded.as_slice()
+    } else if decoded.len() == 44 {
+        const ED25519_SPKI_PREFIX: [u8; 12] = [
+            0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+
+        if decoded[..12] != ED25519_SPKI_PREFIX {
+            return Err("Chave publica SPKI invalida para Ed25519.".to_string());
+        }
+
+        &decoded[12..]
+    } else {
+        return Err(
+            "Chave publica invalida: esperado raw 32 bytes ou SPKI DER 44 bytes.".to_string(),
+        );
+    };
+
+    let key_bytes: [u8; 32] = key_slice
+        .try_into()
+        .map_err(|_| "Chave publica invalida: tamanho incorreto.".to_string())?;
+
+    VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|err| format!("Chave publica invalida: {}", err))
+}
+
+fn to_public_claims(claims: &LicenseClaims) -> LicenseClaimsPublic {
+    LicenseClaimsPublic {
+        product: claims.product.clone(),
+        version: claims
+            .version
+            .as_ref()
+            .and_then(normalize_license_version),
+        email: claims.email.clone(),
+        machine_code: claims.machine_code.clone(),
+        exp: claims.exp,
+        iat: claims.iat,
+    }
+}
+
+fn normalize_license_version(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+async fn get_license_challenge() -> Result<LicenseChallenge, String> {
+    Ok(LicenseChallenge {
+        product: LICENSE_PRODUCT.to_string(),
+        version: LICENSE_VERSION.to_string(),
+        platform: platform_label(),
+        machine_code: machine_code(),
+    })
+}
+
+#[tauri::command]
+async fn verify_license_key(license_key: String) -> Result<LicenseVerificationResult, String> {
+    let (payload_b64, signature_b64) = parse_license_key_parts(&license_key)?;
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(payload_b64.as_bytes())
+        .map_err(|_| "Payload da chave invalido.".to_string())?;
+
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(signature_b64.as_bytes())
+        .map_err(|_| "Assinatura da chave invalida.".to_string())?;
+
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|_| "Assinatura da chave invalida.".to_string())?;
+
+    let public_key = decode_public_key()?;
+    public_key
+        .verify(&payload_bytes, &signature)
+        .map_err(|_| "Assinatura da chave nao confere.".to_string())?;
+
+    let claims: LicenseClaims = serde_json::from_slice(&payload_bytes)
+        .map_err(|_| "Claims da chave invalidos.".to_string())?;
+
+    if claims.product != LICENSE_PRODUCT {
+        return Ok(LicenseVerificationResult {
+            valid: false,
+            message: "A chave nao pertence a este software.".to_string(),
+            claims: Some(to_public_claims(&claims)),
+        });
+    }
+
+    if let Some(version_value) = &claims.version {
+        let normalized = normalize_license_version(version_value);
+        if normalized.as_deref() != Some(LICENSE_VERSION) {
+            return Ok(LicenseVerificationResult {
+                valid: false,
+                message: "Versao da chave incompativel com o app.".to_string(),
+                claims: Some(to_public_claims(&claims)),
+            });
+        }
+    }
+
+    if let Some(exp) = claims.exp {
+        let now = current_unix_secs()?;
+        if now > exp {
+            return Ok(LicenseVerificationResult {
+                valid: false,
+                message: "A chave expirou.".to_string(),
+                claims: Some(to_public_claims(&claims)),
+            });
+        }
+    }
+
+    if let Some(expected_machine) = &claims.machine_code {
+        let current_machine = machine_code();
+        if expected_machine != &current_machine {
+            return Ok(LicenseVerificationResult {
+                valid: false,
+                message: "Esta chave foi gerada para outra maquina.".to_string(),
+                claims: Some(to_public_claims(&claims)),
+            });
+        }
+    }
+
+    Ok(LicenseVerificationResult {
+        valid: true,
+        message: "Chave valida.".to_string(),
+        claims: Some(to_public_claims(&claims)),
+    })
 }
 
 fn is_valid_youtube_url(url: &str) -> bool {
@@ -196,6 +483,38 @@ fn build_audio_selector(max_bitrate: u32) -> String {
     format!("bestaudio[abr<={0}]/bestaudio", max_bitrate)
 }
 
+fn resolve_playlist_entry_url(entry: &RawPlaylistEntry) -> Option<String> {
+    if let Some(webpage_url) = &entry.webpage_url {
+        if !webpage_url.trim().is_empty() {
+            return Some(webpage_url.trim().to_string());
+        }
+    }
+
+    if let Some(url) = &entry.url {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return Some(trimmed.to_string());
+        }
+
+        return Some(format!("https://www.youtube.com/watch?v={}", trimmed));
+    }
+
+    if let Some(id) = &entry.id {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        return Some(format!("https://www.youtube.com/watch?v={}", trimmed));
+    }
+
+    None
+}
+
 #[tauri::command]
 async fn fetch_video_metadata(url: String) -> Result<VideoMetadata, String> {
     if !is_valid_youtube_url(&url) {
@@ -240,6 +559,83 @@ async fn fetch_video_metadata(url: String) -> Result<VideoMetadata, String> {
         duration_seconds: raw.duration,
         webpage_url: raw.webpage_url,
         thumbnail: raw.thumbnail,
+    })
+}
+
+#[tauri::command]
+async fn fetch_playlist_entries(url: String) -> Result<PlaylistData, String> {
+    if !is_valid_youtube_url(&url) {
+        return Err("URL invalida: informe um link do YouTube (youtube.com ou youtu.be).".to_string());
+    }
+
+    let yt_dlp = resolve_executable("yt-dlp")?;
+    let url_clone = url.clone();
+
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        run_process(
+            &yt_dlp,
+            &["--dump-single-json", "--flat-playlist", "--skip-download", &url_clone],
+        )
+    })
+    .await
+    .map_err(|err| format!("Falha na task de playlist: {}", err))??;
+
+    if !output.status_ok {
+        let message = if output.stderr.trim().is_empty() {
+            "Falha ao carregar playlist no yt-dlp.".to_string()
+        } else {
+            format!("yt-dlp retornou erro: {}", output.stderr.trim())
+        };
+        return Err(message);
+    }
+
+    let raw: RawPlaylistJson = serde_json::from_str(&output.stdout)
+        .map_err(|err| format!("Falha ao ler resposta da playlist: {}", err))?;
+
+    let mut entries = Vec::new();
+    for item in raw.entries.unwrap_or_default().into_iter().take(300) {
+        let Some(resolved_url) = resolve_playlist_entry_url(&item) else {
+            continue;
+        };
+
+        let title = item
+            .title
+            .unwrap_or_else(|| "Video sem titulo".to_string())
+            .trim()
+            .to_string();
+
+        let id = item.id.unwrap_or_else(|| {
+            resolved_url
+                .split("v=")
+                .nth(1)
+                .unwrap_or("unknown")
+                .split('&')
+                .next()
+                .unwrap_or("unknown")
+                .to_string()
+        });
+
+        entries.push(PlaylistEntry {
+            id,
+            title,
+            url: resolved_url,
+            channel: item.channel.or(item.uploader),
+            duration_seconds: item.duration,
+        });
+    }
+
+    if entries.is_empty() {
+        return Err("Nao encontramos videos validos nessa playlist.".to_string());
+    }
+
+    Ok(PlaylistData {
+        id: raw.id,
+        title: raw
+            .title
+            .unwrap_or_else(|| "Playlist do YouTube".to_string())
+            .trim()
+            .to_string(),
+        entries,
     })
 }
 
@@ -397,7 +793,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![fetch_video_metadata, start_download])
+        .invoke_handler(tauri::generate_handler![
+            fetch_video_metadata,
+            fetch_playlist_entries,
+            get_license_challenge,
+            verify_license_key,
+            start_download
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
