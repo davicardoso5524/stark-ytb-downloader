@@ -1,7 +1,54 @@
-# Tauri + React + Typescript
+# Stark Tube v1.0.0
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+Aplicativo desktop para baixar videos e playlists do YouTube com interface moderna em React + Vite e backend local com Tauri (Rust).
 
-## Recommended IDE Setup
+## Recursos
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+- Download de video com selecao de formato/qualidade
+- Download de playlist com fila, retry e skip
+- Historico local de downloads
+- Configuracoes persistentes no app
+- Validacao de licenca local (offline) por assinatura
+
+## Stack
+
+- Frontend: React 19 + TypeScript + Vite
+- Desktop: Tauri v2
+- Backend local: Rust
+
+## Requisitos
+
+- Node.js 20+
+- Rust (toolchain estavel)
+- Dependencias de build do Tauri para Windows
+
+## Desenvolvimento
+
+```bash
+npm install
+npm run tauri dev
+```
+
+## Build Web
+
+```bash
+npm run build
+```
+
+## Build Desktop e Instalador
+
+```bash
+npm run tauri build
+```
+
+O instalador e os binarios sao gerados em `src-tauri/target/release/bundle/`.
+
+## Licenciamento Local
+
+- O app gera um `machineCode` local
+- A key e validada offline com assinatura Ed25519
+- Nao ha validacao remota obrigatoria no fluxo de login
+
+## Versao
+
+- Versao inicial: `1.0.0`
