@@ -7,6 +7,7 @@ export type AppSettings = {
   preferredMediaType: MediaType;
   defaultVideoQuality: string;
   defaultAudioQuality: string;
+  downloadConcurrency: number;
 };
 
 type SettingsPageProps = {
@@ -101,6 +102,26 @@ export default function SettingsPage(props: SettingsPageProps) {
               <option value="192">MP3 192 kbps</option>
               <option value="128">MP3 128 kbps</option>
               <option value="64">MP3 64 kbps</option>
+            </select>
+          </label>
+
+          <label className="text-xs text-muted-foreground sm:col-span-2">
+            Downloads simultaneos (1-5)
+            <select
+              value={String(settings.downloadConcurrency)}
+              onChange={(e) =>
+                onSettingsChange({
+                  ...settings,
+                  downloadConcurrency: Math.max(1, Math.min(5, Number(e.target.value) || 3)),
+                })
+              }
+              className="mt-1 w-full bg-secondary border border-border text-foreground rounded-lg px-2.5 py-2 outline-none"
+            >
+              <option value="1">1 download por vez</option>
+              <option value="2">2 downloads</option>
+              <option value="3">3 downloads (recomendado)</option>
+              <option value="4">4 downloads</option>
+              <option value="5">5 downloads</option>
             </select>
           </label>
         </div>

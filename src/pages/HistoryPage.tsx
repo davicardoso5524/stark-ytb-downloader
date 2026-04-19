@@ -16,10 +16,11 @@ type HistoryPageProps = {
   statusLabel: (status: DownloadHistoryStatus) => string;
   onApply: (entryId: string) => void;
   onRedownload: (entryId: string) => void;
+  onOpenFolder: (entryId: string) => void;
 };
 
 export default function HistoryPage(props: HistoryPageProps) {
-  const { entries, isDownloading, formatHistoryTime, statusLabel, onApply, onRedownload } = props;
+  const { entries, isDownloading, formatHistoryTime, statusLabel, onApply, onRedownload, onOpenFolder } = props;
 
   return (
     <div className="max-w-2xl mx-auto px-4 py-8 space-y-3">
@@ -51,6 +52,13 @@ export default function HistoryPage(props: HistoryPageProps) {
                 className="h-8 px-3 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50"
               >
                 Baixar novamente
+              </button>
+              <button
+                type="button"
+                onClick={() => onOpenFolder(entry.id)}
+                className="h-8 px-3 rounded-md bg-secondary text-xs font-semibold hover:bg-secondary/80"
+              >
+                Ir para pasta
               </button>
             </div>
           </article>

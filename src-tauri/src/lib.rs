@@ -8,9 +8,11 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::path::BaseDirectory;
+use tauri::{AppHandle, Emitter, Manager};
 
 const LICENSE_PRODUCT: &str = "stark-tube";
+const LICENSE_PRODUCT_LEGACY: &str = "yt-download";
 const LICENSE_VERSION: &str = "1";
 const LICENSE_KEY_PREFIX: &str = "YTDL1";
 // Troque por sua chave publica Ed25519 em base64 (32 bytes).
@@ -58,7 +60,7 @@ struct RawYtDlpJson {
     id: Option<String>,
     title: Option<String>,
     uploader: Option<String>,
-    duration: Option<u64>,
+    duration: Option<serde_json::Value>,
     webpage_url: Option<String>,
     thumbnail: Option<String>,
 }
@@ -72,7 +74,7 @@ struct RawPlaylistEntry {
     webpage_url: Option<String>,
     uploader: Option<String>,
     channel: Option<String>,
-    duration: Option<u64>,
+    duration: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +88,7 @@ struct RawPlaylistJson {
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DownloadProgressEvent {
+    task_id: String,
     video_title: String,
     percent: f64,
     raw_line: String,
@@ -94,6 +97,7 @@ struct DownloadProgressEvent {
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DownloadDoneEvent {
+    task_id: String,
     message: String,
 }
 
@@ -134,6 +138,48 @@ struct LicenseVerificationResult {
     valid: bool,
     message: String,
     claims: Option<LicenseClaimsPublic>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PersistedDownloadHistoryEntry {
+    id: String,
+    source: String,
+    url: String,
+    title: String,
+    destination_folder: String,
+    media_type: String,
+    format: String,
+    quality: String,
+    status: String,
+    percent: f64,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PersistedDownloadHistory {
+    standard: Vec<PersistedDownloadHistoryEntry>,
+    playlist: Vec<PersistedDownloadHistoryEntry>,
+}
+
+fn license_storage_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("Nao foi possivel resolver AppData: {}", err))?;
+
+    Ok(app_data_dir.join("license.key"))
+}
+
+fn history_storage_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("Nao foi possivel resolver AppData: {}", err))?;
+
+    Ok(app_data_dir.join("download_history.json"))
 }
 
 fn platform_label() -> String {
@@ -254,6 +300,10 @@ fn normalize_license_version(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn is_supported_license_product(product: &str) -> bool {
+    product == LICENSE_PRODUCT || product == LICENSE_PRODUCT_LEGACY
+}
+
 #[tauri::command]
 async fn get_license_challenge() -> Result<LicenseChallenge, String> {
     Ok(LicenseChallenge {
@@ -287,7 +337,7 @@ async fn verify_license_key(license_key: String) -> Result<LicenseVerificationRe
     let claims: LicenseClaims = serde_json::from_slice(&payload_bytes)
         .map_err(|_| "Claims da chave invalidos.".to_string())?;
 
-    if claims.product != LICENSE_PRODUCT {
+    if !is_supported_license_product(&claims.product) {
         return Ok(LicenseVerificationResult {
             valid: false,
             message: "A chave nao pertence a este software.".to_string(),
@@ -335,6 +385,94 @@ async fn verify_license_key(license_key: String) -> Result<LicenseVerificationRe
     })
 }
 
+#[tauri::command]
+async fn get_persisted_license_key(app: AppHandle) -> Result<Option<String>, String> {
+    let path = license_storage_path(&app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| format!("Falha ao ler chave salva: {}", err))?;
+    let trimmed = raw.trim();
+
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+#[tauri::command]
+async fn persist_license_key(app: AppHandle, license_key: String) -> Result<(), String> {
+    let trimmed = license_key.trim();
+    if trimmed.is_empty() {
+        return Err("Chave vazia nao pode ser salva.".to_string());
+    }
+
+    let path = license_storage_path(&app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Falha ao preparar pasta de dados: {}", err))?;
+    }
+
+    fs::write(&path, trimmed.as_bytes())
+        .map_err(|err| format!("Falha ao salvar chave localmente: {}", err))
+}
+
+#[tauri::command]
+async fn clear_persisted_license_key(app: AppHandle) -> Result<(), String> {
+    let path = license_storage_path(&app)?;
+    if !path.exists() {
+        return Ok(());
+    }
+
+    fs::remove_file(&path)
+        .map_err(|err| format!("Falha ao remover chave local salva: {}", err))
+}
+
+#[tauri::command]
+async fn get_persisted_download_history(app: AppHandle) -> Result<PersistedDownloadHistory, String> {
+    let path = history_storage_path(&app)?;
+    if !path.exists() {
+        return Ok(PersistedDownloadHistory {
+            standard: Vec::new(),
+            playlist: Vec::new(),
+        });
+    }
+
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| format!("Falha ao ler historico salvo: {}", err))?;
+
+    if raw.trim().is_empty() {
+        return Ok(PersistedDownloadHistory {
+            standard: Vec::new(),
+            playlist: Vec::new(),
+        });
+    }
+
+    serde_json::from_str::<PersistedDownloadHistory>(&raw)
+        .map_err(|err| format!("Falha ao interpretar historico salvo: {}", err))
+}
+
+#[tauri::command]
+async fn persist_download_history(
+    app: AppHandle,
+    history: PersistedDownloadHistory,
+) -> Result<(), String> {
+    let path = history_storage_path(&app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Falha ao preparar pasta do historico: {}", err))?;
+    }
+
+    let json = serde_json::to_string_pretty(&history)
+        .map_err(|err| format!("Falha ao serializar historico: {}", err))?;
+
+    fs::write(&path, json.as_bytes())
+        .map_err(|err| format!("Falha ao salvar historico local: {}", err))
+}
+
 fn is_valid_youtube_url(url: &str) -> bool {
     let trimmed = url.trim();
     if trimmed.is_empty() {
@@ -346,7 +484,7 @@ fn is_valid_youtube_url(url: &str) -> bool {
         && (lower.contains("youtube.com/") || lower.contains("youtu.be/"))
 }
 
-fn candidate_paths(tool_name: &str) -> Vec<PathBuf> {
+fn candidate_paths(tool_name: &str, app: Option<&AppHandle>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let executable = if cfg!(windows) {
         format!("{}.exe", tool_name)
@@ -364,12 +502,80 @@ fn candidate_paths(tool_name: &str) -> Vec<PathBuf> {
         if let Some(exe_dir) = exe_path.parent() {
             candidates.push(
                 exe_dir
+                    .join("_up_")
                     .join("tools")
                     .join("bin")
                     .join("windows")
                     .join(&executable),
             );
+            candidates.push(
+                exe_dir
+                    .join("_up_")
+                    .join("bin")
+                    .join("windows")
+                    .join(&executable),
+            );
+            candidates.push(exe_dir.join("_up_").join(&executable));
+            candidates.push(exe_dir.join("resources").join("tools").join("bin").join("windows").join(&executable));
+            candidates.push(exe_dir.join("resources").join(&executable));
+            candidates.push(
+                exe_dir
+                    .join("tools")
+                    .join("bin")
+                    .join("windows")
+                    .join(&executable),
+            );
+            candidates.push(exe_dir.join("bin").join("windows").join(&executable));
+            candidates.push(exe_dir.join("bin").join(&executable));
             candidates.push(exe_dir.join(&executable));
+        }
+    }
+
+    if let Some(app_handle) = app {
+        if let Ok(app_local_data_dir) = app_handle.path().app_local_data_dir() {
+            candidates.push(
+                app_local_data_dir
+                    .join("_up_")
+                    .join("tools")
+                    .join("bin")
+                    .join("windows")
+                    .join(&executable),
+            );
+            candidates.push(
+                app_local_data_dir
+                    .join("tools")
+                    .join("bin")
+                    .join("windows")
+                    .join(&executable),
+            );
+            candidates.push(app_local_data_dir.join(&executable));
+        }
+
+        if let Ok(resource_dir) = app_handle.path().resource_dir() {
+            candidates.push(resource_dir.join("tools").join("bin").join("windows").join(&executable));
+            candidates.push(resource_dir.join("bin").join("windows").join(&executable));
+            candidates.push(resource_dir.join(&executable));
+        }
+
+        if let Ok(resolved) = app_handle
+            .path()
+            .resolve(format!("tools/bin/windows/{}", executable), BaseDirectory::Resource)
+        {
+            candidates.push(resolved);
+        }
+
+        if let Ok(resolved) = app_handle
+            .path()
+            .resolve(format!("bin/windows/{}", executable), BaseDirectory::Resource)
+        {
+            candidates.push(resolved);
+        }
+
+        if let Ok(resolved) = app_handle
+            .path()
+            .resolve(&executable, BaseDirectory::Resource)
+        {
+            candidates.push(resolved);
         }
     }
 
@@ -389,8 +595,8 @@ fn run_process(executable: &str, args: &[&str]) -> Result<ProcessOutput, String>
     })
 }
 
-fn resolve_executable(tool_name: &str) -> Result<String, String> {
-    for path in candidate_paths(tool_name) {
+fn resolve_executable(tool_name: &str, app: Option<&AppHandle>) -> Result<String, String> {
+    for path in candidate_paths(tool_name, app) {
         if path.exists() {
             let executable = path.to_string_lossy().to_string();
             if run_process(&executable, &["--version"]).is_ok() {
@@ -472,6 +678,33 @@ fn normalize_audio_quality(input: &str) -> u32 {
     }
 }
 
+fn normalize_duration_seconds(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(as_u64) = n.as_u64() {
+                return Some(as_u64);
+            }
+
+            n.as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| v.floor() as u64)
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            trimmed
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| v.floor() as u64)
+        }
+        _ => None,
+    }
+}
+
 fn build_video_selector(max_height: u32) -> String {
     format!(
         "bestvideo[height<={0}]+bestaudio/best[height<={0}]/best",
@@ -516,12 +749,12 @@ fn resolve_playlist_entry_url(entry: &RawPlaylistEntry) -> Option<String> {
 }
 
 #[tauri::command]
-async fn fetch_video_metadata(url: String) -> Result<VideoMetadata, String> {
+async fn fetch_video_metadata(app: AppHandle, url: String) -> Result<VideoMetadata, String> {
     if !is_valid_youtube_url(&url) {
         return Err("URL invalida: informe um link do YouTube (youtube.com ou youtu.be).".to_string());
     }
 
-    let yt_dlp = resolve_executable("yt-dlp")?;
+    let yt_dlp = resolve_executable("yt-dlp", Some(&app))?;
     let url_clone = url.clone();
 
     let output = tauri::async_runtime::spawn_blocking(move || {
@@ -556,19 +789,22 @@ async fn fetch_video_metadata(url: String) -> Result<VideoMetadata, String> {
         id,
         title,
         uploader: raw.uploader,
-        duration_seconds: raw.duration,
+        duration_seconds: raw
+            .duration
+            .as_ref()
+            .and_then(normalize_duration_seconds),
         webpage_url: raw.webpage_url,
         thumbnail: raw.thumbnail,
     })
 }
 
 #[tauri::command]
-async fn fetch_playlist_entries(url: String) -> Result<PlaylistData, String> {
+async fn fetch_playlist_entries(app: AppHandle, url: String) -> Result<PlaylistData, String> {
     if !is_valid_youtube_url(&url) {
         return Err("URL invalida: informe um link do YouTube (youtube.com ou youtu.be).".to_string());
     }
 
-    let yt_dlp = resolve_executable("yt-dlp")?;
+    let yt_dlp = resolve_executable("yt-dlp", Some(&app))?;
     let url_clone = url.clone();
 
     let output = tauri::async_runtime::spawn_blocking(move || {
@@ -620,7 +856,10 @@ async fn fetch_playlist_entries(url: String) -> Result<PlaylistData, String> {
             title,
             url: resolved_url,
             channel: item.channel.or(item.uploader),
-            duration_seconds: item.duration,
+            duration_seconds: item
+                .duration
+                .as_ref()
+                .and_then(normalize_duration_seconds),
         });
     }
 
@@ -642,6 +881,7 @@ async fn fetch_playlist_entries(url: String) -> Result<PlaylistData, String> {
 #[tauri::command]
 async fn start_download(
     app: AppHandle,
+    task_id: String,
     url: String,
     destination_folder: String,
     video_title: Option<String>,
@@ -661,12 +901,13 @@ async fn start_download(
     fs::create_dir_all(destination)
         .map_err(|err| format!("Nao foi possivel preparar pasta de destino: {}", err))?;
 
-    let yt_dlp = resolve_executable("yt-dlp")?;
-    let ffmpeg_location = resolve_executable("ffmpeg")
+    let yt_dlp = resolve_executable("yt-dlp", Some(&app))?;
+    let ffmpeg_location = resolve_executable("ffmpeg", Some(&app))
         .ok()
         .and_then(|path| PathBuf::from(path).parent().map(|p| p.to_path_buf()));
 
     let app_handle = app.clone();
+    let task_id_clone = task_id.clone();
     let url_clone = url.clone();
     let destination_clone = destination.to_string();
     let expected_title = video_title.unwrap_or_else(|| "Video em download".to_string());
@@ -676,6 +917,7 @@ async fn start_download(
 
     tauri::async_runtime::spawn(async move {
         let app_for_emit = app_handle.clone();
+        let task_id_for_emit = task_id_clone.clone();
         let result = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
             let mut command = Command::new(&yt_dlp);
             command
@@ -736,6 +978,7 @@ async fn start_download(
 
                 if let Some(percent) = extract_percent(&line) {
                     let payload = DownloadProgressEvent {
+                        task_id: task_id_for_emit.clone(),
                         video_title: current_title.clone(),
                         percent,
                         raw_line: line.clone(),
@@ -762,6 +1005,7 @@ async fn start_download(
                 let _ = app_handle.emit(
                     "download-complete",
                     DownloadDoneEvent {
+                        task_id: task_id_clone.clone(),
                         message: "Download finalizado com sucesso.".to_string(),
                     },
                 );
@@ -770,6 +1014,7 @@ async fn start_download(
                 let _ = app_handle.emit(
                     "download-error",
                     DownloadDoneEvent {
+                        task_id: task_id_clone.clone(),
                         message: err,
                     },
                 );
@@ -778,6 +1023,7 @@ async fn start_download(
                 let _ = app_handle.emit(
                     "download-error",
                     DownloadDoneEvent {
+                        task_id: task_id_clone,
                         message: format!("Falha na task de download: {}", join_err),
                     },
                 );
@@ -786,6 +1032,46 @@ async fn start_download(
     });
 
     Ok(())
+}
+
+#[tauri::command]
+async fn open_folder(path: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Pasta de destino invalida.".to_string());
+    }
+
+    let folder = PathBuf::from(trimmed);
+    if !folder.exists() {
+        return Err("A pasta de destino nao existe mais.".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|err| format!("Falha ao abrir pasta no Explorer: {}", err))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|err| format!("Falha ao abrir pasta: {}", err))?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|err| format!("Falha ao abrir pasta: {}", err))?;
+        return Ok(());
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -798,6 +1084,12 @@ pub fn run() {
             fetch_playlist_entries,
             get_license_challenge,
             verify_license_key,
+            get_persisted_license_key,
+            persist_license_key,
+            clear_persisted_license_key,
+            get_persisted_download_history,
+            persist_download_history,
+            open_folder,
             start_download
         ])
         .run(tauri::generate_context!())

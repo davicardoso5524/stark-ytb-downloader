@@ -28,21 +28,25 @@ type VideoMetadata = {
 };
 
 type DownloadProgressEvent = {
+  taskId: string;
   videoTitle: string;
   percent: number;
   rawLine: string;
 };
 
 type DownloadDoneEvent = {
+  taskId: string;
   message: string;
 };
 
 type MediaType = "video" | "audio";
+type DownloadSource = "standard" | "playlist";
 
 type DownloadHistoryStatus = "started" | "completed" | "failed";
 
 type DownloadHistoryEntry = {
   id: string;
+  source: DownloadSource;
   url: string;
   title: string;
   destinationFolder: string;
@@ -62,7 +66,125 @@ const LICENSE_STORAGE_KEY = "stark_tube_license_key_v1";
 const USER_NAME_STORAGE_KEY = "stark_tube_user_name_v1";
 const KEY_SITE_URL = "https://starktube-web-key.vercel.app/";
 
+async function readPersistedLicenseKey(): Promise<string | null> {
+  try {
+    const persisted = await invoke<string | null>("get_persisted_license_key");
+    const normalized = persisted?.trim() ?? "";
+    return normalized || null;
+  } catch {
+    const fallback = localStorage.getItem(LICENSE_STORAGE_KEY)?.trim() ?? "";
+    return fallback || null;
+  }
+}
+
+async function savePersistedLicenseKey(key: string): Promise<void> {
+  const normalized = key.trim();
+  if (!normalized) {
+    return;
+  }
+
+  localStorage.setItem(LICENSE_STORAGE_KEY, normalized);
+
+  try {
+    await invoke("persist_license_key", { licenseKey: normalized });
+  } catch {
+    // keep local fallback when command is unavailable
+  }
+}
+
+async function clearPersistedLicenseKey(): Promise<void> {
+  localStorage.removeItem(LICENSE_STORAGE_KEY);
+
+  try {
+    await invoke("clear_persisted_license_key");
+  } catch {
+    // ignore when command is unavailable
+  }
+}
+
+function normalizeHistoryEntry(entry: Partial<DownloadHistoryEntry>): DownloadHistoryEntry | null {
+  if (!entry.id || !entry.url || !entry.title || !entry.destinationFolder) {
+    return null;
+  }
+
+  const mediaType: MediaType = entry.mediaType === "audio" ? "audio" : "video";
+  const status: DownloadHistoryStatus =
+    entry.status === "completed" || entry.status === "failed" ? entry.status : "started";
+
+  return {
+    id: entry.id,
+    source: entry.source === "playlist" ? "playlist" : "standard",
+    url: entry.url,
+    title: entry.title,
+    destinationFolder: entry.destinationFolder,
+    mediaType,
+    format: entry.format || (mediaType === "audio" ? "mp3" : "mp4"),
+    quality: entry.quality || (mediaType === "audio" ? "192" : "1080"),
+    status,
+    percent: Number.isFinite(entry.percent) ? Number(entry.percent) : 0,
+    createdAt: entry.createdAt || new Date().toISOString(),
+    updatedAt: entry.updatedAt || entry.createdAt || new Date().toISOString(),
+  };
+}
+
+function mergeHistoryFromStore(store: PersistedDownloadHistory): DownloadHistoryEntry[] {
+  const combined = [...store.standard, ...store.playlist]
+    .map((item) => normalizeHistoryEntry(item))
+    .filter((item): item is DownloadHistoryEntry => Boolean(item));
+
+  return combined
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+    .slice(0, HISTORY_LIMIT * 2);
+}
+
+function splitHistoryForStore(entries: DownloadHistoryEntry[]): PersistedDownloadHistory {
+  const standard = entries.filter((entry) => entry.source === "standard").slice(0, HISTORY_LIMIT);
+  const playlist = entries.filter((entry) => entry.source === "playlist").slice(0, HISTORY_LIMIT);
+  return { standard, playlist };
+}
+
+async function readPersistedDownloadHistory(): Promise<DownloadHistoryEntry[]> {
+  try {
+    const history = await invoke<PersistedDownloadHistory>("get_persisted_download_history");
+    return mergeHistoryFromStore(history || { standard: [], playlist: [] });
+  } catch {
+    try {
+      const legacyRaw = localStorage.getItem(HISTORY_STORAGE_KEY);
+      if (!legacyRaw) {
+        return [];
+      }
+
+      const parsed = JSON.parse(legacyRaw) as Partial<DownloadHistoryEntry>[];
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+
+      return parsed
+        .map((item) => normalizeHistoryEntry(item))
+        .filter((item): item is DownloadHistoryEntry => Boolean(item))
+        .slice(0, HISTORY_LIMIT * 2);
+    } catch {
+      return [];
+    }
+  }
+}
+
+async function persistDownloadHistory(entries: DownloadHistoryEntry[]): Promise<void> {
+  const payload = splitHistoryForStore(entries);
+
+  try {
+    await invoke("persist_download_history", { history: payload });
+  } catch {
+    try {
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(entries.slice(0, HISTORY_LIMIT * 2)));
+    } catch {
+      // ignore storage errors
+    }
+  }
+}
+
 type DownloadConfig = {
+  source: DownloadSource;
   url: string;
   destinationFolder: string;
   mediaType: MediaType;
@@ -89,6 +211,11 @@ type LicenseVerificationResult = {
   message: string;
 };
 
+type PersistedDownloadHistory = {
+  standard: DownloadHistoryEntry[];
+  playlist: DownloadHistoryEntry[];
+};
+
 type QueueItemStatus = "pending" | "downloading" | "completed" | "failed" | "skipped";
 
 type QueueUiItem = PlaylistItem & {
@@ -102,12 +229,27 @@ type QueueTask = {
   attempt: number;
 };
 
+type BulkLinkStatus = "validating" | "ready" | "queued" | "downloading" | "completed" | "failed";
+
+type BulkLinkItem = {
+  id: string;
+  url: string;
+  title: string;
+  thumbnail?: string;
+  channel?: string;
+  status: BulkLinkStatus;
+  lastError?: string;
+};
+
 const DEFAULT_SETTINGS: AppSettings = {
   defaultDestinationFolder: "",
   preferredMediaType: "video",
   defaultVideoQuality: "1080",
   defaultAudioQuality: "320",
+  downloadConcurrency: 3,
 };
+
+const BULK_LINK_LIMIT = 10;
 
 type ActivePage = "downloader" | "playlist" | "history" | "settings";
 
@@ -178,18 +320,30 @@ function App() {
   const [isLoadingPlaylist, setIsLoadingPlaylist] = useState(false);
   const [playlistNotice, setPlaylistNotice] = useState("");
   const [playlistData, setPlaylistData] = useState<PlaylistData | null>(null);
+  const [showDownloaderRecents, setShowDownloaderRecents] = useState(true);
+  const [showPlaylistRecents, setShowPlaylistRecents] = useState(true);
+  const [bulkLinkInput, setBulkLinkInput] = useState("");
+  const [bulkLinks, setBulkLinks] = useState<BulkLinkItem[]>([]);
+  const [bulkNotice, setBulkNotice] = useState("");
   const [isQueueRunning, setIsQueueRunning] = useState(false);
   const [queueUiItems, setQueueUiItems] = useState<QueueUiItem[]>([]);
+  const [selectedPlaylistIds, setSelectedPlaylistIds] = useState<string[]>([]);
   const [queueCurrentId, setQueueCurrentId] = useState<string | null>(null);
+  const [activeTaskCount, setActiveTaskCount] = useState(0);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [userName, setUserName] = useState("");
   const [loginKey, setLoginKey] = useState("");
   const [loginError, setLoginError] = useState("");
   const [isCheckingLicense, setIsCheckingLicense] = useState(false);
   const [licenseChallenge, setLicenseChallenge] = useState<LicenseChallenge | null>(null);
-  const activeHistoryIdRef = useRef<string | null>(null);
+  const taskHistoryRef = useRef<Map<string, string>>(new Map());
+  const taskResolverRef = useRef<
+    Map<string, { resolve: () => void; reject: (error: Error) => void }>
+  >(new Map());
   const playlistQueueRef = useRef<QueueTask[]>([]);
   const queueUiItemsRef = useRef<QueueUiItem[]>([]);
+  const bulkQueueRef = useRef<string[]>([]);
+  const bulkLinksRef = useRef<BulkLinkItem[]>([]);
 
   const MAX_QUEUE_RETRIES = 2;
 
@@ -223,11 +377,10 @@ function App() {
     let mounted = true;
 
     void (async () => {
-      const cachedKey = localStorage.getItem(LICENSE_STORAGE_KEY)?.trim();
+      const cachedKey = await readPersistedLicenseKey();
       if (!cachedKey) {
         return;
       }
-
       setIsCheckingLicense(true);
 
       try {
@@ -244,11 +397,11 @@ function App() {
           setLoginError("");
           setLoginKey(cachedKey);
         } else {
-          localStorage.removeItem(LICENSE_STORAGE_KEY);
+          await clearPersistedLicenseKey();
         }
       } catch {
         if (mounted) {
-          localStorage.removeItem(LICENSE_STORAGE_KEY);
+          await clearPersistedLicenseKey();
         }
       } finally {
         if (mounted) {
@@ -263,19 +416,18 @@ function App() {
   }, []);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
-      if (!raw) {
-        return;
-      }
+    let mounted = true;
 
-      const parsed = JSON.parse(raw) as DownloadHistoryEntry[];
-      if (Array.isArray(parsed)) {
-        setHistoryEntries(parsed.slice(0, HISTORY_LIMIT));
+    void (async () => {
+      const next = await readPersistedDownloadHistory();
+      if (mounted) {
+        setHistoryEntries(next);
       }
-    } catch {
-      setHistoryEntries([]);
-    }
+    })();
+
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -283,85 +435,179 @@ function App() {
   }, [queueUiItems]);
 
   useEffect(() => {
-    if (!isQueueRunning || isDownloading) {
+    bulkLinksRef.current = bulkLinks;
+  }, [bulkLinks]);
+
+  const maxParallelDownloads = Math.max(1, Math.min(5, settings.downloadConcurrency || 3));
+  const canStartAnotherDownload = activeTaskCount < maxParallelDownloads;
+
+  useEffect(() => {
+    if (!isQueueRunning) {
       return;
     }
 
-    const nextTask = playlistQueueRef.current.shift();
-    if (!nextTask) {
-      setIsQueueRunning(false);
-      setQueueCurrentId(null);
+    const runningQueueDownloads = queueUiItemsRef.current.filter(
+      (item) => item.status === "downloading",
+    ).length;
+    const maxConcurrency = Math.max(1, Math.min(5, settings.downloadConcurrency || 3));
+
+    if (runningQueueDownloads >= maxConcurrency) {
       return;
     }
 
-    const queueItem = queueUiItemsRef.current.find((item) => item.id === nextTask.id);
-    if (!queueItem || queueItem.status === "skipped") {
+    let availableSlots = maxConcurrency - runningQueueDownloads;
+
+    while (availableSlots > 0) {
+      const nextTask = playlistQueueRef.current.shift();
+      if (!nextTask) {
+        break;
+      }
+
+      const queueItem = queueUiItemsRef.current.find((item) => item.id === nextTask.id);
+      if (!queueItem || queueItem.status === "skipped") {
+        continue;
+      }
+
+      setQueueCurrentId(queueItem.id);
+      setQueueUiItems((prev) =>
+        prev.map((item) =>
+          item.id === queueItem.id
+            ? {
+                ...item,
+                status: "downloading",
+                attempts: Math.max(item.attempts, nextTask.attempt),
+              }
+            : item,
+        ),
+      );
+
+      void (async () => {
+        try {
+          await downloadPlaylistItem(queueItem);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (nextTask.attempt < MAX_QUEUE_RETRIES) {
+            const nextAttempt = nextTask.attempt + 1;
+            playlistQueueRef.current.push({ id: queueItem.id, attempt: nextAttempt });
+            setQueueUiItems((prev) =>
+              prev.map((item) =>
+                item.id === queueItem.id
+                  ? {
+                      ...item,
+                      status: "pending",
+                      attempts: nextAttempt,
+                      lastError: message,
+                    }
+                  : item,
+              ),
+            );
+          } else {
+            setQueueUiItems((prev) =>
+              prev.map((item) =>
+                item.id === queueItem.id
+                  ? {
+                      ...item,
+                      status: "failed",
+                      attempts: nextTask.attempt,
+                      lastError: message,
+                    }
+                  : item,
+              ),
+            );
+          }
+        } finally {
+          setQueueCurrentId(null);
+        }
+      })();
+
+      availableSlots -= 1;
+    }
+  }, [activeTaskCount, isQueueRunning, settings.downloadConcurrency]);
+
+  useEffect(() => {
+    const maxConcurrency = Math.max(1, Math.min(5, settings.downloadConcurrency || 3));
+    const runningBulkDownloads = bulkLinksRef.current.filter((item) => item.status === "downloading").length;
+
+    if (runningBulkDownloads >= maxConcurrency) {
       return;
     }
 
-    setQueueCurrentId(queueItem.id);
-    setQueueUiItems((prev) =>
-      prev.map((item) =>
-        item.id === queueItem.id
-          ? {
-              ...item,
-              status: "downloading",
-              attempts: Math.max(item.attempts, nextTask.attempt),
-            }
-          : item,
-      ),
-    );
+    let availableSlots = maxConcurrency - runningBulkDownloads;
+    const selection = getCurrentFormatSelection();
 
-    void (async () => {
-      try {
-        await downloadPlaylistItem(queueItem);
-        setQueueUiItems((prev) =>
-          prev.map((item) =>
-            item.id === queueItem.id
-              ? {
-                  ...item,
-                  status: "completed",
-                  lastError: undefined,
-                }
-              : item,
-          ),
-        );
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (nextTask.attempt < MAX_QUEUE_RETRIES) {
-          const nextAttempt = nextTask.attempt + 1;
-          playlistQueueRef.current.push({ id: queueItem.id, attempt: nextAttempt });
-          setQueueUiItems((prev) =>
+    while (availableSlots > 0) {
+      const nextId = bulkQueueRef.current.shift();
+      if (!nextId) {
+        break;
+      }
+
+      const nextItem = bulkLinksRef.current.find((item) => item.id === nextId);
+      if (!nextItem || nextItem.status !== "queued") {
+        continue;
+      }
+
+      setBulkLinks((prev) =>
+        prev.map((item) =>
+          item.id === nextId
+            ? {
+                ...item,
+                status: "downloading",
+                lastError: undefined,
+              }
+            : item,
+        ),
+      );
+
+      void (async () => {
+        try {
+          await runDownload({
+            source: "standard",
+            url: nextItem.url,
+            destinationFolder: destinationFolder.trim(),
+            videoTitle: nextItem.title || nextItem.url,
+            mediaType: selection.mediaType,
+            format: selection.format,
+            quality: selection.quality,
+          });
+
+          setBulkLinks((prev) =>
             prev.map((item) =>
-              item.id === queueItem.id
+              item.id === nextId
                 ? {
                     ...item,
-                    status: "pending",
-                    attempts: nextAttempt,
-                    lastError: message,
+                    status: "completed",
+                    lastError: undefined,
                   }
                 : item,
             ),
           );
-        } else {
-          setQueueUiItems((prev) =>
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          setBulkLinks((prev) =>
             prev.map((item) =>
-              item.id === queueItem.id
+              item.id === nextId
                 ? {
                     ...item,
                     status: "failed",
-                    attempts: nextTask.attempt,
                     lastError: message,
                   }
                 : item,
             ),
           );
         }
-      } finally {
-        setQueueCurrentId(null);
-      }
-    })();
-  }, [isDownloading, isQueueRunning]);
+      })();
+
+      availableSlots -= 1;
+    }
+  }, [
+    activeTaskCount,
+    bulkLinks,
+    destinationFolder,
+    formatTab,
+    selectedAudioQuality,
+    selectedVideoQuality,
+    settings.downloadConcurrency,
+  ]);
 
   const queueSummary = useMemo(() => {
     const total = queueUiItems.length;
@@ -396,13 +642,13 @@ function App() {
     }
 
     const finished = queueSummary.completed + queueSummary.failed + queueSummary.skipped;
-    if (finished >= queueSummary.total && !isDownloading && playlistQueueRef.current.length === 0) {
+    if (finished >= queueSummary.total && queueSummary.downloading === 0 && playlistQueueRef.current.length === 0) {
       setIsQueueRunning(false);
       setPlaylistNotice(
         `Fila finalizada: ${queueSummary.completed} concluido(s), ${queueSummary.failed} falha(s), ${queueSummary.skipped} pulado(s).`,
       );
     }
-  }, [isDownloading, isQueueRunning, queueSummary]);
+  }, [isQueueRunning, queueSummary]);
 
   useEffect(() => {
     try {
@@ -417,6 +663,7 @@ function App() {
         preferredMediaType: parsed.preferredMediaType === "audio" ? "audio" : "video",
         defaultVideoQuality: parsed.defaultVideoQuality || "1080",
         defaultAudioQuality: parsed.defaultAudioQuality || "320",
+        downloadConcurrency: Math.max(1, Math.min(5, Number(parsed.downloadConcurrency) || 3)),
       };
 
       setSettings(next);
@@ -434,11 +681,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(historyEntries));
-    } catch {
-      // keep UI funcional mesmo se localStorage estiver indisponivel
-    }
+    void persistDownloadHistory(historyEntries);
   }, [historyEntries]);
 
   useEffect(() => {
@@ -466,15 +709,17 @@ function App() {
 
     const setupListeners = async () => {
       disposeProgress = await listen<DownloadProgressEvent>("download-progress", (event) => {
-        setIsDownloading(true);
+        setActiveTaskCount(taskResolverRef.current.size);
+        setIsDownloading(taskResolverRef.current.size > 0);
         const percent = Math.max(0, Math.min(100, Number(event.payload.percent) || 0));
         setDownloadPercent(percent);
         if (event.payload.videoTitle) {
           setDownloadTitle(event.payload.videoTitle);
         }
 
-        if (activeHistoryIdRef.current) {
-          updateHistoryEntry(activeHistoryIdRef.current, (entry) => ({
+        const historyId = taskHistoryRef.current.get(event.payload.taskId);
+        if (historyId) {
+          updateHistoryEntry(historyId, (entry) => ({
             ...entry,
             title: event.payload.videoTitle || entry.title,
             percent,
@@ -484,33 +729,51 @@ function App() {
       });
 
       disposeComplete = await listen<DownloadDoneEvent>("download-complete", (event) => {
-        setIsDownloading(false);
+        const resolver = taskResolverRef.current.get(event.payload.taskId);
+        if (resolver) {
+          resolver.resolve();
+          taskResolverRef.current.delete(event.payload.taskId);
+        }
+
+        const historyId = taskHistoryRef.current.get(event.payload.taskId);
+        taskHistoryRef.current.delete(event.payload.taskId);
+
+        setActiveTaskCount(taskResolverRef.current.size);
+        setIsDownloading(taskResolverRef.current.size > 0);
         setDownloadPercent(100);
         setStatus(event.payload.message);
 
-        if (activeHistoryIdRef.current) {
-          updateHistoryEntry(activeHistoryIdRef.current, (entry) => ({
+        if (historyId) {
+          updateHistoryEntry(historyId, (entry) => ({
             ...entry,
             status: "completed",
             percent: 100,
             updatedAt: new Date().toISOString(),
           }));
-          activeHistoryIdRef.current = null;
         }
       });
 
       disposeError = await listen<DownloadDoneEvent>("download-error", (event) => {
-        setIsDownloading(false);
+        const resolver = taskResolverRef.current.get(event.payload.taskId);
+        if (resolver) {
+          resolver.reject(new Error(event.payload.message));
+          taskResolverRef.current.delete(event.payload.taskId);
+        }
+
+        const historyId = taskHistoryRef.current.get(event.payload.taskId);
+        taskHistoryRef.current.delete(event.payload.taskId);
+
+        setActiveTaskCount(taskResolverRef.current.size);
+        setIsDownloading(taskResolverRef.current.size > 0);
         setError(event.payload.message);
         setStatus("Falha no download.");
 
-        if (activeHistoryIdRef.current) {
-          updateHistoryEntry(activeHistoryIdRef.current, (entry) => ({
+        if (historyId) {
+          updateHistoryEntry(historyId, (entry) => ({
             ...entry,
             status: "failed",
             updatedAt: new Date().toISOString(),
           }));
-          activeHistoryIdRef.current = null;
         }
       });
     };
@@ -531,7 +794,7 @@ function App() {
   }, []);
 
   function addHistoryEntry(entry: DownloadHistoryEntry) {
-    setHistoryEntries((prev) => [entry, ...prev].slice(0, HISTORY_LIMIT));
+    setHistoryEntries((prev) => [entry, ...prev].slice(0, HISTORY_LIMIT * 2));
   }
 
   async function fetchMetadataFromUrl(nextUrl: string) {
@@ -544,6 +807,18 @@ function App() {
     return invoke<PlaylistData>("fetch_playlist_entries", {
       url: nextUrl.trim(),
     });
+  }
+
+  function isYoutubeUrl(value: string) {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    return (
+      (normalized.startsWith("https://") || normalized.startsWith("http://")) &&
+      (normalized.includes("youtube.com/") || normalized.includes("youtu.be/"))
+    );
   }
 
   const isUrlFormatValid = useMemo(() => {
@@ -568,10 +843,36 @@ function App() {
 
       if (typeof selected === "string") {
         setDestinationFolder(selected);
+        setSettings((prev) =>
+          prev.defaultDestinationFolder === selected
+            ? prev
+            : {
+                ...prev,
+                defaultDestinationFolder: selected,
+              },
+        );
       }
     } catch {
       setError("Nao foi possivel abrir o seletor de pastas.");
     }
+  }
+
+  function handleDestinationFolderChange(value: string) {
+    setDestinationFolder(value);
+
+    const normalized = value.trim();
+    if (!normalized) {
+      return;
+    }
+
+    setSettings((prev) =>
+      prev.defaultDestinationFolder === normalized
+        ? prev
+        : {
+            ...prev,
+            defaultDestinationFolder: normalized,
+          },
+    );
   }
 
   async function validateUrl() {
@@ -622,6 +923,7 @@ function App() {
           attempts: 0,
         })),
       );
+      setSelectedPlaylistIds([]);
       setPlaylistNotice(`Playlist carregada: ${data.entries.length} video(s).`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -631,12 +933,133 @@ function App() {
     }
   }
 
+  async function addBulkLink() {
+    const nextUrl = bulkLinkInput.trim();
+    setBulkNotice("");
+
+    if (!nextUrl) {
+      setBulkNotice("Cole um link antes de adicionar ao multi link.");
+      return;
+    }
+
+    if (!isYoutubeUrl(nextUrl)) {
+      setBulkNotice("Use um link valido do YouTube para o multi link.");
+      return;
+    }
+
+    if (bulkLinksRef.current.length >= BULK_LINK_LIMIT) {
+      setBulkNotice(`Limite do multi link: ${BULK_LINK_LIMIT} links.`);
+      return;
+    }
+
+    if (bulkLinksRef.current.some((item) => item.url.trim().toLowerCase() === nextUrl.toLowerCase())) {
+      setBulkNotice("Esse link ja foi adicionado no multi link.");
+      return;
+    }
+
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setBulkLinkInput("");
+    setBulkLinks((prev) => [
+      {
+        id,
+        url: nextUrl,
+        title: "Buscando metadados...",
+        status: "validating",
+      },
+      ...prev,
+    ]);
+
+    try {
+      const meta = await fetchMetadataFromUrl(nextUrl);
+      setBulkLinks((prev) =>
+        prev.map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                title: meta.title || nextUrl,
+                thumbnail: meta.thumbnail,
+                channel: meta.uploader,
+                status: "ready",
+              }
+            : item,
+        ),
+      );
+    } catch {
+      setBulkLinks((prev) =>
+        prev.map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                title: nextUrl,
+                status: "ready",
+              }
+            : item,
+        ),
+      );
+      setBulkNotice("Alguns links ficaram sem metadados, mas podem ser baixados normalmente.");
+    }
+  }
+
+  function removeBulkLink(itemId: string) {
+    bulkQueueRef.current = bulkQueueRef.current.filter((id) => id !== itemId);
+    setBulkLinks((prev) => prev.filter((item) => item.id !== itemId));
+  }
+
+  function clearBulkLinks() {
+    bulkQueueRef.current = [];
+    setBulkLinks([]);
+    setBulkNotice("");
+  }
+
+  function startBulkDownloads() {
+    setError("");
+
+    if (!destinationFolder.trim()) {
+      setError("Selecione uma pasta de destino antes do download.");
+      setBulkNotice("Defina a pasta de destino para iniciar o multi link.");
+      return;
+    }
+
+    const resumableIds = bulkLinksRef.current
+      .filter((item) => item.status === "ready" || item.status === "failed")
+      .map((item) => item.id);
+
+    if (resumableIds.length === 0) {
+      setBulkNotice("Nao ha links prontos para baixar no multi link.");
+      return;
+    }
+
+    const alreadyQueued = new Set(bulkQueueRef.current);
+    const toQueue = resumableIds.filter((id) => !alreadyQueued.has(id));
+
+    if (toQueue.length === 0) {
+      setBulkNotice("Multi link ja esta em andamento.");
+      return;
+    }
+
+    bulkQueueRef.current.push(...toQueue);
+    setBulkLinks((prev) =>
+      prev.map((item) =>
+        toQueue.includes(item.id)
+          ? {
+              ...item,
+              status: "queued",
+              lastError: undefined,
+            }
+          : item,
+      ),
+    );
+    setBulkNotice(`Multi link iniciado com ${toQueue.length} link(s).`);
+  }
+
   async function runDownload(config: DownloadConfig) {
     const historyId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const taskId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const now = new Date().toISOString();
 
     addHistoryEntry({
       id: historyId,
+      source: config.source,
       url: config.url,
       title: config.videoTitle,
       destinationFolder: config.destinationFolder,
@@ -649,19 +1072,31 @@ function App() {
       updatedAt: now,
     });
 
-    activeHistoryIdRef.current = historyId;
+    taskHistoryRef.current.set(taskId, historyId);
     setDownloadPercent(0);
     setDownloadTitle(config.videoTitle);
     setIsDownloading(true);
     setStatus("Iniciando download...");
 
-    await invoke("start_download", {
-      url: config.url,
-      destinationFolder: config.destinationFolder,
-      videoTitle: config.videoTitle,
-      mediaType: config.mediaType,
-      format: config.format,
-      quality: config.quality,
+    await new Promise<void>((resolve, reject) => {
+      taskResolverRef.current.set(taskId, { resolve, reject });
+      setActiveTaskCount(taskResolverRef.current.size);
+
+      void invoke("start_download", {
+        taskId,
+        url: config.url,
+        destinationFolder: config.destinationFolder,
+        videoTitle: config.videoTitle,
+        mediaType: config.mediaType,
+        format: config.format,
+        quality: config.quality,
+      }).catch((err) => {
+        taskResolverRef.current.delete(taskId);
+        taskHistoryRef.current.delete(taskId);
+        setActiveTaskCount(taskResolverRef.current.size);
+        setIsDownloading(taskResolverRef.current.size > 0);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      });
     });
   }
 
@@ -678,8 +1113,14 @@ function App() {
       return;
     }
 
+    if (!canStartAnotherDownload) {
+      setError(`Limite de ${maxParallelDownloads} downloads simultaneos atingido.`);
+      return;
+    }
+
     try {
       await runDownload({
+        source: "standard",
         url: url.trim(),
         destinationFolder: destinationFolder.trim(),
         videoTitle: metadata.title,
@@ -688,8 +1129,6 @@ function App() {
         quality: mediaType === "video" ? videoQuality : audioQuality,
       });
     } catch (err) {
-      activeHistoryIdRef.current = null;
-      setIsDownloading(false);
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
       setStatus("Falha ao iniciar download.");
@@ -730,13 +1169,30 @@ function App() {
       return;
     }
 
+    if (!canStartAnotherDownload) {
+      setPlaylistNotice(`Limite de ${maxParallelDownloads} downloads simultaneos atingido.`);
+      return;
+    }
+
     const selection = getCurrentFormatSelection();
 
     setError("");
     setStatus(`Baixando item da playlist: ${item.title}`);
+    setQueueUiItems((prev) =>
+      prev.map((entry) =>
+        entry.id === item.id
+          ? {
+              ...entry,
+              status: "downloading",
+              lastError: undefined,
+            }
+          : entry,
+      ),
+    );
 
     try {
       await runDownload({
+        source: "playlist",
         url: item.url,
         destinationFolder: destinationFolder.trim(),
         videoTitle: item.title,
@@ -744,8 +1200,32 @@ function App() {
         format: selection.format,
         quality: selection.quality,
       });
+
+      setQueueUiItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id
+            ? {
+                ...entry,
+                status: "completed",
+                lastError: undefined,
+              }
+            : entry,
+        ),
+      );
+      setSelectedPlaylistIds((prev) => prev.filter((id) => id !== item.id));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      setQueueUiItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id
+            ? {
+                ...entry,
+                status: "failed",
+                lastError: message,
+              }
+            : entry,
+        ),
+      );
       setError(message);
       setStatus("Falha ao iniciar download de item da playlist.");
       throw err;
@@ -772,9 +1252,74 @@ function App() {
       return;
     }
 
+    if (resumable.length > 5) {
+      setPlaylistNotice(
+        `Voce selecionou ${resumable.length} itens. Para volumes maiores que 5, recomendamos usar fluxo de playlist com fila.`
+      );
+    }
+
     playlistQueueRef.current = resumable;
     setIsQueueRunning(true);
     setPlaylistNotice(`Fila iniciada com ${resumable.length} item(ns).`);
+  }
+
+  function queueSelectedPlaylistDownloads() {
+    if (!playlistData || queueUiItems.length === 0) {
+      setPlaylistNotice("Nenhum item disponivel para download na playlist.");
+      return;
+    }
+
+    if (!destinationFolder.trim()) {
+      setPlaylistNotice("Defina a pasta de destino antes de baixar a playlist.");
+      return;
+    }
+
+    if (selectedPlaylistIds.length === 0) {
+      setPlaylistNotice("Selecione pelo menos um item da playlist.");
+      return;
+    }
+
+    const selected = new Set(selectedPlaylistIds);
+    const resumable = queueUiItems
+      .filter(
+        (item) =>
+          selected.has(item.id) &&
+          (item.status === "pending" || item.status === "failed" || item.status === "skipped"),
+      )
+      .map((item) => ({ id: item.id, attempt: item.attempts }));
+
+    if (resumable.length === 0) {
+      setPlaylistNotice("Os itens selecionados ja foram concluidos ou estao indisponiveis.");
+      return;
+    }
+
+    if (resumable.length > 5) {
+      setPlaylistNotice(
+        `Voce selecionou ${resumable.length} itens. Para volumes maiores que 5, recomendamos usar fluxo de playlist com fila.`
+      );
+    }
+
+    playlistQueueRef.current = resumable;
+    setIsQueueRunning(true);
+    setPlaylistNotice(`Fila selecionada iniciada com ${resumable.length} item(ns).`);
+  }
+
+  function togglePlaylistSelection(itemId: string) {
+    setSelectedPlaylistIds((prev) =>
+      prev.includes(itemId) ? prev.filter((id) => id !== itemId) : [...prev, itemId],
+    );
+  }
+
+  function toggleSelectAllPlaylist(selectAll: boolean) {
+    if (!selectAll) {
+      setSelectedPlaylistIds([]);
+      return;
+    }
+
+    const selectableIds = queueUiItems
+      .filter((item) => item.status !== "completed")
+      .map((item) => item.id);
+    setSelectedPlaylistIds(selectableIds);
   }
 
   function cancelPlaylistQueue() {
@@ -810,7 +1355,7 @@ function App() {
   }
 
   function skipQueueItem(itemId: string) {
-    if (queueCurrentId === itemId && isDownloading) {
+    if (queueUiItemsRef.current.some((entry) => entry.id === itemId && entry.status === "downloading")) {
       setPlaylistNotice("Nao e possivel pular o item em andamento no momento.");
       return;
     }
@@ -847,7 +1392,8 @@ function App() {
   }
 
   async function redownloadFromHistory(entry: DownloadHistoryEntry) {
-    if (isDownloading) {
+    if (!canStartAnotherDownload) {
+      setError(`Limite de ${maxParallelDownloads} downloads simultaneos atingido.`);
       return;
     }
 
@@ -860,6 +1406,7 @@ function App() {
       setMetadata(result);
 
       await runDownload({
+        source: entry.source,
         url: entry.url,
         destinationFolder: entry.destinationFolder,
         mediaType: entry.mediaType,
@@ -868,11 +1415,20 @@ function App() {
         videoTitle: result.title,
       });
     } catch (err) {
-      activeHistoryIdRef.current = null;
-      setIsDownloading(false);
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
       setStatus("Falha ao repetir download do historico.");
+    }
+  }
+
+  async function openHistoryDestinationFolder(entry: DownloadHistoryEntry) {
+    try {
+      await invoke("open_folder", {
+        path: entry.destinationFolder,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message || "Nao foi possivel abrir a pasta de destino.");
     }
   }
 
@@ -884,7 +1440,13 @@ function App() {
     }
   }
 
-  const topDownloadEntries = historyEntries.slice(0, 8);
+  const topDownloadEntries = historyEntries
+    .filter((entry) => entry.source === "standard")
+    .slice(0, 8);
+
+  const topPlaylistEntries = historyEntries
+    .filter((entry) => entry.source === "playlist")
+    .slice(0, 8);
 
   const currentVideo = metadata
     ? {
@@ -900,6 +1462,30 @@ function App() {
 
   const selectedOptions = formatTab === "video" ? VIDEO_OPTIONS : AUDIO_OPTIONS;
   const selectedQuality = formatTab === "video" ? selectedVideoQuality : selectedAudioQuality;
+  const canStartDownload = activeTaskCount < maxParallelDownloads;
+  const bulkReadyCount = bulkLinks.filter(
+    (item) => item.status === "ready" || item.status === "failed",
+  ).length;
+
+  useEffect(() => {
+    if (bulkLinks.length === 0) {
+      return;
+    }
+
+    const hasInFlight = bulkLinks.some(
+      (item) => item.status === "queued" || item.status === "downloading" || item.status === "validating",
+    );
+    if (hasInFlight || bulkQueueRef.current.length > 0) {
+      return;
+    }
+
+    const completed = bulkLinks.filter((item) => item.status === "completed").length;
+    const failed = bulkLinks.filter((item) => item.status === "failed").length;
+
+    if (completed > 0 || failed > 0) {
+      setBulkNotice(`Multi link finalizado: ${completed} concluido(s), ${failed} falha(s).`);
+    }
+  }, [bulkLinks]);
 
   function handleSettingsChange(next: AppSettings) {
     setSettings(next);
@@ -959,7 +1545,7 @@ function App() {
         return;
       }
 
-      localStorage.setItem(LICENSE_STORAGE_KEY, key);
+      await savePersistedLicenseKey(key);
       localStorage.setItem(USER_NAME_STORAGE_KEY, trimmedName);
       setUserName(trimmedName);
       setLoggedIn(true);
@@ -1116,8 +1702,14 @@ function App() {
             <DownloaderPage
               url={url}
               destinationFolder={destinationFolder}
+              bulkLinkInput={bulkLinkInput}
+              bulkLinks={bulkLinks}
+              bulkNotice={bulkNotice}
+              bulkLinkLimit={BULK_LINK_LIMIT}
+              bulkReadyCount={bulkReadyCount}
               isValidating={isValidating}
               isDownloading={isDownloading}
+              canStartDownload={canStartDownload}
               downloadPercent={downloadPercent}
               downloadTitle={downloadTitle}
               status={status}
@@ -1128,15 +1720,23 @@ function App() {
               selectedOptions={selectedOptions}
               selectedQuality={selectedQuality}
               topDownloadEntries={topDownloadEntries}
+              showRecentDownloads={showDownloaderRecents}
               statusLabel={statusLabel}
               onUrlChange={setUrl}
               onValidateUrl={() => {
                 void validateUrl();
               }}
-              onDestinationChange={setDestinationFolder}
+              onDestinationChange={handleDestinationFolderChange}
               onPickFolder={() => {
                 void pickFolder();
               }}
+              onBulkLinkInputChange={setBulkLinkInput}
+              onAddBulkLink={() => {
+                void addBulkLink();
+              }}
+              onStartBulkDownload={startBulkDownloads}
+              onRemoveBulkLink={removeBulkLink}
+              onClearBulkLinks={clearBulkLinks}
               onSetFormatTab={setFormatTab}
               onSelectQuality={(optionId) => {
                 if (formatTab === "video") {
@@ -1149,6 +1749,15 @@ function App() {
                 void startDownloadFromSelector();
               }}
               onOpenHistory={openHistoryPage}
+              onOpenFolder={(entryId) => {
+                const entry = historyEntries.find((item) => item.id === entryId);
+                if (entry) {
+                  void openHistoryDestinationFolder(entry);
+                }
+              }}
+              onToggleRecentDownloads={() => {
+                setShowDownloaderRecents((prev) => !prev);
+              }}
             />
           ) : null}
 
@@ -1170,6 +1779,12 @@ function App() {
                   void redownloadFromHistory(entry);
                 }
               }}
+              onOpenFolder={(entryId) => {
+                const entry = historyEntries.find((item) => item.id === entryId);
+                if (entry) {
+                  void openHistoryDestinationFolder(entry);
+                }
+              }}
             />
           ) : null}
 
@@ -1181,8 +1796,14 @@ function App() {
               playlistNotice={playlistNotice}
               playlistData={playlistData}
               isDownloading={isDownloading}
+              canStartDownload={canStartDownload}
+              downloadPercent={downloadPercent}
+              downloadTitle={downloadTitle}
               isQueueRunning={isQueueRunning}
               queueItems={queueUiItems}
+              selectedItemIds={selectedPlaylistIds}
+              topPlaylistEntries={topPlaylistEntries}
+              showPlaylistRecents={showPlaylistRecents}
               queueSummary={queueSummary}
               onLoadPlaylist={() => {
                 void loadPlaylist();
@@ -1191,9 +1812,22 @@ function App() {
                 void downloadPlaylistItem(item);
               }}
               onDownloadAll={queuePlaylistDownloads}
+              onDownloadSelected={queueSelectedPlaylistDownloads}
               onCancelQueue={cancelPlaylistQueue}
               onRetryItem={retryQueueItem}
               onSkipItem={skipQueueItem}
+              onToggleSelectItem={togglePlaylistSelection}
+              onToggleSelectAll={toggleSelectAllPlaylist}
+              onTogglePlaylistRecents={() => {
+                setShowPlaylistRecents((prev) => !prev);
+              }}
+              onOpenFolder={(entryId) => {
+                const entry = historyEntries.find((item) => item.id === entryId);
+                if (entry) {
+                  void openHistoryDestinationFolder(entry);
+                }
+              }}
+              onOpenHistory={openHistoryPage}
             />
           ) : null}
 

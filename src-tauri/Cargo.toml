@@ -1,6 +1,6 @@
 [package]
 name = "stark-tube"
-version = "2.0.0"
+version = "4.0.0"
 description = "Stark Tube desktop downloader built with Tauri"
 authors = ["Stark Tube"]
 edition = "2021"
